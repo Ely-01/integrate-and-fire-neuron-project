@@ -1,313 +1,280 @@
 import numpy as np
 
-try:
-    from numba import njit
-except ModuleNotFoundError:
-    def njit(func=None, **_kwargs):
-        if func is None:
-            return lambda wrapped: wrapped
-        return func
 
+def simulate_white_spike_times(
+    mu_q,
+    sigma_q,
+    tau_q=20.0,
+    threshold=1.0,
+    reset=0.0,
+    dt=0.05,
+    t_max=1000.0,
+    n_neurons=10000,
+    refractory_ms=0.0,
+    seed=-1,
+):
+    """Spike times for Burkitt's white-noise LIF model.
 
-@njit
-def _simulate_white_fpt(mu_q, sigma_q, tau_q, v_th, v_reset, dt, t_max, n_neurons, refractory_period, seed):
-    if seed >= 0:
-        np.random.seed(seed)
-
-    n_steps = int(np.ceil(t_max / dt))
+    The simulated equation is
+    dV = (mu_Q - V) / tau_Q dt + sigma_Q sqrt(2 / tau_Q) dW.
+    """
+    rng = np.random.default_rng(None if seed < 0 else seed)
+    step_count = int(np.ceil(t_max / dt))
     sqrt_dt = np.sqrt(dt)
-    noise_coeff = sigma_q * np.sqrt(2.0 / tau_q)
+    noise_scale = sigma_q * np.sqrt(2.0 / tau_q)
 
-    v = np.full(n_neurons, v_reset, dtype=np.float64)
-    fpt = np.full(n_neurons, np.nan, dtype=np.float64)
-    has_spiked = np.zeros(n_neurons, dtype=np.bool_)
-    spiked_count = 0
+    voltage = np.full(int(n_neurons), reset, dtype=float)
+    spike_times = np.full(int(n_neurons), np.nan, dtype=float)
+    active = np.arange(int(n_neurons))
 
-    for step in range(n_steps):
-        if spiked_count == n_neurons:
+    for step in range(step_count):
+        if active.size == 0:
             break
 
-        t_left = step * dt
+        step_start_time = step * dt
+        old_voltage = voltage[active]
+        new_voltage = old_voltage + (mu_q - old_voltage) / tau_q * dt
+        if sigma_q > 0.0:
+            new_voltage = new_voltage + noise_scale * sqrt_dt * rng.standard_normal(active.size)
+        voltage[active] = new_voltage
 
-        for i in range(n_neurons):
-            if has_spiked[i]:
-                continue
+        crossed = new_voltage >= threshold
+        if np.any(crossed):
+            crossed_neurons = active[crossed]
+            crossing_fraction = threshold_crossing_fraction(old_voltage[crossed], new_voltage[crossed], threshold)
+            spike_times[crossed_neurons] = refractory_ms + step_start_time + crossing_fraction * dt
+            active = active[~crossed]
 
-            v_old = v[i]
-            drift = (mu_q - v_old) / tau_q
-            noise = 0.0
-            if sigma_q > 0.0:
-                noise = noise_coeff * sqrt_dt * np.random.randn()
-
-            v_new = v_old + drift * dt + noise
-            v[i] = v_new
-
-            if v_new >= v_th:
-                frac = 1.0
-                if v_new != v_old:
-                    frac = (v_th - v_old) / (v_new - v_old)
-                    if frac < 0.0:
-                        frac = 0.0
-                    elif frac > 1.0:
-                        frac = 1.0
-
-                fpt[i] = refractory_period + t_left + frac * dt
-                has_spiked[i] = True
-                spiked_count += 1
-
-    return fpt
+    return spike_times
 
 
-@njit
-def _simulate_colored_fpt(
+def simulate_colored_spike_times(
     mu_q,
     sigma_q,
     tau_c,
-    tau_q,
-    v_th,
-    v_reset,
-    dt,
-    t_max,
-    n_neurons,
-    refractory_period,
-    seed,
-):
-    if tau_c <= 0.0:
-        return _simulate_white_fpt(
-            mu_q, sigma_q, tau_q, v_th, v_reset, dt, t_max, n_neurons, refractory_period, seed
-        )
-
-    if seed >= 0:
-        np.random.seed(seed)
-
-    n_steps = int(np.ceil(t_max / dt))
-    colored_to_voltage = sigma_q * np.sqrt(2.0 / tau_q)
-
-    # OU colored noise eta has autocovariance exp(-|t| / tau_c) / (2 tau_c).
-    # This normalization converges to white noise as tau_c -> 0.
-    decay = np.exp(-dt / tau_c)
-    eta_step_std = np.sqrt((1.0 - decay * decay) / (2.0 * tau_c))
-    eta_stationary_std = np.sqrt(1.0 / (2.0 * tau_c))
-
-    v = np.full(n_neurons, v_reset, dtype=np.float64)
-    eta = np.empty(n_neurons, dtype=np.float64)
-    for i in range(n_neurons):
-        eta[i] = eta_stationary_std * np.random.randn()
-
-    fpt = np.full(n_neurons, np.nan, dtype=np.float64)
-    has_spiked = np.zeros(n_neurons, dtype=np.bool_)
-    spiked_count = 0
-
-    for step in range(n_steps):
-        if spiked_count == n_neurons:
-            break
-
-        t_left = step * dt
-
-        for i in range(n_neurons):
-            if has_spiked[i]:
-                continue
-
-            eta[i] = decay * eta[i] + eta_step_std * np.random.randn()
-
-            v_old = v[i]
-            drift = (mu_q - v_old) / tau_q
-            v_new = v_old + (drift + colored_to_voltage * eta[i]) * dt
-            v[i] = v_new
-
-            if v_new >= v_th:
-                frac = 1.0
-                if v_new != v_old:
-                    frac = (v_th - v_old) / (v_new - v_old)
-                    if frac < 0.0:
-                        frac = 0.0
-                    elif frac > 1.0:
-                        frac = 1.0
-
-                fpt[i] = refractory_period + t_left + frac * dt
-                has_spiked[i] = True
-                spiked_count += 1
-
-    return fpt
-
-
-def _coalesce(value, alias, name):
-    if value is None and alias is None:
-        raise ValueError(f"{name} must be provided")
-    if value is not None and alias is not None:
-        raise ValueError(f"Provide either {name} or its alias, not both")
-    return alias if alias is not None else value
-
-
-def simulate_first_passage_times(
-    mu=None,
-    sigma=None,
-    tau=20.0,
-    v_th=1.0,
-    v_reset=0.0,
+    tau_q=20.0,
+    threshold=1.0,
+    reset=0.0,
     dt=0.05,
     t_max=1000.0,
     n_neurons=10000,
-    refractory_period=0.0,
+    refractory_ms=0.0,
     seed=-1,
-    *,
-    mu_q=None,
-    sigma_q=None,
-    tau_q=None,
 ):
-    """First-passage times for the white-noise LIF model
+    """Spike times when the white-noise term is replaced by OU colored noise."""
+    if tau_c <= 0.0:
+        return simulate_white_spike_times(
+            mu_q=mu_q,
+            sigma_q=sigma_q,
+            tau_q=tau_q,
+            threshold=threshold,
+            reset=reset,
+            dt=dt,
+            t_max=t_max,
+            n_neurons=n_neurons,
+            refractory_ms=refractory_ms,
+            seed=seed,
+        )
 
-    Parameters follow the paper convention:
-    - mu: equilibrium mean of the free membrane potential
-    - sigma: stationary standard deviation of the free potential
-    - tau: membrane time constant
+    rng = np.random.default_rng(None if seed < 0 else seed)
+    step_count = int(np.ceil(t_max / dt))
+    voltage_noise_scale = sigma_q * np.sqrt(2.0 / tau_q)
 
-    simulated SDE is dV = (mu_q - V) / tau_q dt
-    + sigma_q * sqrt(2 / tau_q) dW. Threshold crossings are linearly
-    interpolated within the Euler-Maruyama step
-    """
-    mu_q = float(_coalesce(mu, mu_q, "mu"))
-    sigma_q = float(_coalesce(sigma, sigma_q, "sigma"))
-    tau_q = float(tau if tau_q is None else tau_q)
+    noise_decay = np.exp(-dt / tau_c)
+    noise_step_std = np.sqrt((1.0 - noise_decay * noise_decay) / (2.0 * tau_c))
+    noise_stationary_std = np.sqrt(1.0 / (2.0 * tau_c))
 
-    return _simulate_white_fpt(
-        mu_q,
-        sigma_q,
-        tau_q,
-        float(v_th),
-        float(v_reset),
-        float(dt),
-        float(t_max),
-        int(n_neurons),
-        float(refractory_period),
-        int(seed),
-    )
+    voltage = np.full(int(n_neurons), reset, dtype=float)
+    colored_noise = noise_stationary_std * rng.standard_normal(int(n_neurons))
+    spike_times = np.full(int(n_neurons), np.nan, dtype=float)
+    active = np.arange(int(n_neurons))
 
+    for step in range(step_count):
+        if active.size == 0:
+            break
 
-def simulate_colored_first_passage_times(
-    mu=None,
-    sigma=None,
-    tau_c=1.0,
-    tau=20.0,
-    v_th=1.0,
-    v_reset=0.0,
-    dt=0.01,
-    t_max=1000.0,
-    n_neurons=10000,
-    refractory_period=0.0,
-    seed=-1,
-    *,
-    mu_q=None,
-    sigma_q=None,
-    tau_q=None,
-):
-    """First-passage times when the white noise is replaced by OU noise.
+        step_start_time = step * dt
+        colored_noise[active] = noise_decay * colored_noise[active] + noise_step_std * rng.standard_normal(active.size)
 
-    The auxiliary colored noise eta has autocovariance
-    exp(-|t| / tau_c) / (2 tau_c). With this normalization, eta approaches
-    Gaussian white noise as tau_c approaches zero.
-    """
-    mu_q = float(_coalesce(mu, mu_q, "mu"))
-    sigma_q = float(_coalesce(sigma, sigma_q, "sigma"))
-    tau_q = float(tau if tau_q is None else tau_q)
+        old_voltage = voltage[active]
+        drift = (mu_q - old_voltage) / tau_q
+        new_voltage = old_voltage + (drift + voltage_noise_scale * colored_noise[active]) * dt
+        voltage[active] = new_voltage
 
-    return _simulate_colored_fpt(
-        mu_q,
-        sigma_q,
-        float(tau_c),
-        tau_q,
-        float(v_th),
-        float(v_reset),
-        float(dt),
-        float(t_max),
-        int(n_neurons),
-        float(refractory_period),
-        int(seed),
-    )
+        crossed = new_voltage >= threshold
+        if np.any(crossed):
+            crossed_neurons = active[crossed]
+            crossing_fraction = threshold_crossing_fraction(old_voltage[crossed], new_voltage[crossed], threshold)
+            spike_times[crossed_neurons] = refractory_ms + step_start_time + crossing_fraction * dt
+            active = active[~crossed]
+
+    return spike_times
 
 
-def valid_first_passage_times(fpt):
-    """Drop neurons that did not spike before t_max."""
-    return np.asarray(fpt)[np.isfinite(fpt)]
+def threshold_crossing_fraction(old_voltage, new_voltage, threshold):
+    """Linear interpolation of the threshold crossing inside one Euler step."""
+    voltage_change = new_voltage - old_voltage
+    fraction = np.ones_like(new_voltage, dtype=float)
+    nonzero = voltage_change != 0.0
+    fraction[nonzero] = (threshold - old_voltage[nonzero]) / voltage_change[nonzero]
+    return np.clip(fraction, 0.0, 1.0)
 
 
-def firing_rate_from_fpt(fpt, time_scale=1000.0):
-    """Estimate firing rate from first-passage times in Hz when time is in ms."""
-    valid = valid_first_passage_times(fpt)
-    if valid.size == 0:
+def finite_spike_times(spike_times):
+    """Return only neurons that crossed threshold before t_max."""
+    return np.asarray(spike_times)[np.isfinite(spike_times)]
+
+
+def firing_rate_hz(spike_times):
+    """Estimate firing rate in Hz from spike times measured in ms."""
+    valid_times = finite_spike_times(spike_times)
+    if valid_times.size == 0:
         return 0.0
-    return time_scale / np.mean(valid)
+    return 1000.0 / np.mean(valid_times)
 
 
-def cv_from_fpt(fpt):
-    """Coefficient of variation of valid first-passage times."""
-    valid = valid_first_passage_times(fpt)
-    if valid.size < 2:
+def coefficient_of_variation(spike_times):
+    """Coefficient of variation of valid spike times."""
+    valid_times = finite_spike_times(spike_times)
+    if valid_times.size < 2:
         return np.nan
-    return np.std(valid) / np.mean(valid)
+    return np.std(valid_times) / np.mean(valid_times)
 
 
 def simulate_voltage_traces(
-    mu=None,
-    sigma=None,
+    mu_q,
+    sigma_q,
     tau_c=0.0,
-    tau=20.0,
-    v_th=1.0,
-    v_reset=0.0,
+    tau_q=20.0,
+    threshold=1.0,
+    reset=0.0,
     dt=0.05,
     t_max=250.0,
-    n_traces=8,
+    trace_count=8,
     seed=-1,
-    *,
-    mu_q=None,
-    sigma_q=None,
-    tau_q=None,
 ):
-    """Simulate illustrative voltage traces until their first threshold crossing.
-    """
-    mu_q = float(_coalesce(mu, mu_q, "mu"))
-    sigma_q = float(_coalesce(sigma, sigma_q, "sigma"))
-    tau_q = float(tau if tau_q is None else tau_q)
-
+    """Example voltage traces, stopped after the first threshold crossing."""
     rng = np.random.default_rng(None if seed < 0 else seed)
-    n_steps = int(np.ceil(t_max / dt))
-    times = np.arange(n_steps + 1, dtype=float) * dt
-    traces = np.full((int(n_traces), n_steps + 1), np.nan, dtype=float)
-    traces[:, 0] = v_reset
+    step_count = int(np.ceil(t_max / dt))
+    times = np.arange(step_count + 1, dtype=float) * dt
+    traces = np.full((int(trace_count), step_count + 1), np.nan, dtype=float)
+    traces[:, 0] = reset
 
-    active = np.ones(int(n_traces), dtype=bool)
-    v = np.full(int(n_traces), v_reset, dtype=float)
+    voltage = np.full(int(trace_count), reset, dtype=float)
+    active = np.ones(int(trace_count), dtype=bool)
 
-    use_colored = tau_c > 0.0
-    eta = np.zeros(int(n_traces), dtype=float)
-    if use_colored:
-        decay = np.exp(-dt / tau_c)
-        eta_step_std = np.sqrt((1.0 - decay * decay) / (2.0 * tau_c))
-        eta_stationary_std = np.sqrt(1.0 / (2.0 * tau_c))
-        eta = eta_stationary_std * rng.standard_normal(int(n_traces))
+    if tau_c > 0.0:
+        noise_decay = np.exp(-dt / tau_c)
+        noise_step_std = np.sqrt((1.0 - noise_decay * noise_decay) / (2.0 * tau_c))
+        colored_noise = np.sqrt(1.0 / (2.0 * tau_c)) * rng.standard_normal(int(trace_count))
     else:
-        noise_coeff = sigma_q * np.sqrt(2.0 / tau_q)
+        white_noise_step = sigma_q * np.sqrt(2.0 / tau_q) * np.sqrt(dt)
 
-    for step in range(n_steps):
+    for step in range(step_count):
         if not np.any(active):
             break
 
-        idx = np.where(active)[0]
-        v_old = v[idx].copy()
-        drift = (mu_q - v_old) / tau_q
+        active_indices = np.where(active)[0]
+        old_voltage = voltage[active_indices].copy()
+        drift = (mu_q - old_voltage) / tau_q
 
-        if use_colored:
-            eta[idx] = decay * eta[idx] + eta_step_std * rng.standard_normal(idx.size)
-            v_new = v_old + (drift + sigma_q * np.sqrt(2.0 / tau_q) * eta[idx]) * dt
+        if tau_c > 0.0:
+            colored_noise[active_indices] = (
+                noise_decay * colored_noise[active_indices] + noise_step_std * rng.standard_normal(active_indices.size)
+            )
+            new_voltage = old_voltage + (drift + sigma_q * np.sqrt(2.0 / tau_q) * colored_noise[active_indices]) * dt
         else:
-            v_new = v_old + drift * dt + noise_coeff * np.sqrt(dt) * rng.standard_normal(idx.size)
+            new_voltage = old_voltage + drift * dt + white_noise_step * rng.standard_normal(active_indices.size)
 
-        v[idx] = v_new
-        traces[idx, step + 1] = v_new
+        voltage[active_indices] = new_voltage
+        traces[active_indices, step + 1] = new_voltage
 
-        crossed = idx[v_new >= v_th]
-        if crossed.size > 0:
-            traces[crossed, step + 1] = v_th
-            active[crossed] = False
+        crossed = new_voltage >= threshold
+        if np.any(crossed):
+            crossed_indices = active_indices[crossed]
+            traces[crossed_indices, step + 1] = threshold
+            active[crossed_indices] = False
 
     return times, traces
+
+
+def simulate_spike_trains(
+    mu_q,
+    sigma_q,
+    tau_c=0.0,
+    tau_q=20.0,
+    threshold=1.0,
+    reset=0.0,
+    dt=0.1,
+    duration_ms=60000.0,
+    trial_count=20,
+    burn_in_ms=1000.0,
+    refractory_ms=0.0,
+    seed=-1,
+):
+    """Continuous spike trains with voltage reset and persistent input noise.
+
+    For colored noise, only the voltage is reset after a spike. The OU input
+    continues evolving, so temporal memory can pass from one ISI to the next.
+    """
+    rng = np.random.default_rng(None if seed < 0 else seed)
+    trial_count = int(trial_count)
+    total_steps = int(np.ceil((burn_in_ms + duration_ms) / dt))
+    burn_in_steps = int(np.ceil(burn_in_ms / dt))
+
+    voltage = np.full(trial_count, reset, dtype=float)
+    refractory_steps = np.zeros(trial_count, dtype=int)
+    spike_trains = [[] for _ in range(trial_count)]
+    voltage_noise_scale = sigma_q * np.sqrt(2.0 / tau_q)
+
+    if tau_c > 0.0:
+        noise_decay = np.exp(-dt / tau_c)
+        noise_step_std = np.sqrt((1.0 - noise_decay * noise_decay) / (2.0 * tau_c))
+        colored_noise = np.sqrt(1.0 / (2.0 * tau_c)) * rng.standard_normal(trial_count)
+    else:
+        white_noise_step = voltage_noise_scale * np.sqrt(dt)
+
+    refractory_step_count = int(np.ceil(refractory_ms / dt))
+
+    for step in range(total_steps):
+        if tau_c > 0.0:
+            colored_noise = noise_decay * colored_noise + noise_step_std * rng.standard_normal(trial_count)
+
+        refractory = refractory_steps > 0
+        refractory_steps[refractory] -= 1
+        voltage[refractory] = reset
+        active = ~refractory
+        if not np.any(active):
+            continue
+
+        active_indices = np.flatnonzero(active)
+        old_voltage = voltage[active_indices].copy()
+        drift = (mu_q - old_voltage) / tau_q
+
+        if tau_c > 0.0:
+            new_voltage = old_voltage + (
+                drift + voltage_noise_scale * colored_noise[active_indices]
+            ) * dt
+        else:
+            new_voltage = old_voltage + drift * dt
+            new_voltage += white_noise_step * rng.standard_normal(active_indices.size)
+
+        voltage[active_indices] = new_voltage
+        crossed = new_voltage >= threshold
+        if not np.any(crossed):
+            continue
+
+        crossed_indices = active_indices[crossed]
+        crossing_fraction = threshold_crossing_fraction(
+            old_voltage[crossed], new_voltage[crossed], threshold
+        )
+        crossing_times = (step + crossing_fraction) * dt - burn_in_ms
+
+        for neuron, crossing_time in zip(crossed_indices, crossing_times):
+            if step >= burn_in_steps:
+                spike_trains[neuron].append(float(crossing_time))
+
+        voltage[crossed_indices] = reset
+        refractory_steps[crossed_indices] = refractory_step_count
+
+    return [np.asarray(train, dtype=float) for train in spike_trains]
